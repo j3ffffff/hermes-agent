@@ -89,6 +89,64 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_reset_from_rfc3339_or_seconds(value: Any) -> float:
+    """Coerce a reset value to seconds-from-now.
+
+    Generic x-ratelimit-* headers emit integer seconds-until-reset.
+    Anthropic's anthropic-ratelimit-* headers emit RFC3339 timestamps
+    (e.g. ``2026-04-22T01:14:59Z``). Support both.
+    """
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime, timezone
+        target = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def parse_anthropic_rate_limit_headers(
+    headers: Mapping[str, str],
+) -> Optional[RateLimitState]:
+    """Parse ``anthropic-ratelimit-*`` headers into a RateLimitState.
+
+    Anthropic returns per-minute buckets for requests, input tokens, and
+    output tokens, plus a combined-pool ``tokens`` bucket. Map onto the
+    existing four-bucket RateLimitState:
+
+    - ``anthropic-ratelimit-requests-*`` -> ``requests_min``
+    - ``anthropic-ratelimit-input-tokens-*`` -> ``tokens_min``
+    - ``anthropic-ratelimit-tokens-*`` -> ``tokens_hour`` (combined pool)
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+    if not any(k.startswith("anthropic-ratelimit-") for k in lowered):
+        return None
+    now = time.time()
+
+    def _bucket(resource: str) -> RateLimitBucket:
+        return RateLimitBucket(
+            limit=_safe_int(lowered.get(f"anthropic-ratelimit-{resource}-limit")),
+            remaining=_safe_int(lowered.get(f"anthropic-ratelimit-{resource}-remaining")),
+            reset_seconds=_safe_reset_from_rfc3339_or_seconds(
+                lowered.get(f"anthropic-ratelimit-{resource}-reset")
+            ),
+            captured_at=now,
+        )
+
+    return RateLimitState(
+        requests_min=_bucket("requests"),
+        tokens_min=_bucket("input-tokens"),
+        tokens_hour=_bucket("tokens"),
+        captured_at=now,
+        provider="anthropic",
+    )
+
+
 def parse_rate_limit_headers(
     headers: Mapping[str, str],
     provider: str = "",

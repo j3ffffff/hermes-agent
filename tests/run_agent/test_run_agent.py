@@ -3039,16 +3039,25 @@ class TestAnthropicCredentialRefresh:
                 skip_memory=True,
             )
 
-        response = SimpleNamespace(content=[])
+        # D3 observability: _anthropic_messages_create now goes through
+        # messages.with_raw_response.create so response headers are captured
+        # for ~/.hermes/logs/anthropic-usage.jsonl.
+        parsed = SimpleNamespace(content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+        raw = MagicMock()
+        raw.parse.return_value = parsed
+        raw.headers = {"request-id": "req_test"}
+        raw.http_response = SimpleNamespace(status_code=200)
         agent._anthropic_client = MagicMock()
-        agent._anthropic_client.messages.create.return_value = response
+        agent._anthropic_client.messages.with_raw_response.create.return_value = raw
 
         with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=True) as refresh:
             result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
 
         refresh.assert_called_once_with()
-        agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
-        assert result is response
+        agent._anthropic_client.messages.with_raw_response.create.assert_called_once_with(
+            model="claude-sonnet-4-20250514"
+        )
+        assert result is parsed
 
 
 # ===================================================================

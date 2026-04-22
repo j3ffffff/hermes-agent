@@ -4331,7 +4331,51 @@ class AIAgent:
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
-        return self._anthropic_client.messages.create(**api_kwargs)
+        try:
+            from agent.anthropic_usage_logger import record_anthropic_call
+        except Exception:
+            record_anthropic_call = None
+
+        started = time.monotonic()
+        model = api_kwargs.get("model")
+        try:
+            raw = self._anthropic_client.messages.with_raw_response.create(**api_kwargs)
+            message = raw.parse()
+            if record_anthropic_call is not None:
+                try:
+                    headers = dict(raw.headers) if raw.headers else {}
+                    usage = getattr(message, "usage", None)
+                    record_anthropic_call(
+                        headers=headers,
+                        model=model,
+                        status=getattr(raw, "http_response", None).status_code
+                            if getattr(raw, "http_response", None) is not None
+                            else 200,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        request_id=headers.get("request-id") or headers.get("Request-Id"),
+                        input_tokens=getattr(usage, "input_tokens", None),
+                        output_tokens=getattr(usage, "output_tokens", None),
+                    )
+                except Exception:
+                    logger.debug("anthropic usage record failed", exc_info=True)
+            return message
+        except Exception as e:
+            if record_anthropic_call is not None:
+                try:
+                    resp = getattr(e, "response", None)
+                    headers = dict(getattr(resp, "headers", {}) or {}) if resp is not None else {}
+                    status = getattr(resp, "status_code", None) if resp is not None else None
+                    record_anthropic_call(
+                        headers=headers,
+                        model=model,
+                        status=status,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        request_id=headers.get("request-id") or headers.get("Request-Id"),
+                        error=str(e)[:500],
+                    )
+                except Exception:
+                    logger.debug("anthropic usage record (error path) failed", exc_info=True)
+            raise
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
