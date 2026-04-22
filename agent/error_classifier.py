@@ -122,6 +122,14 @@ _RATE_LIMIT_PATTERNS = [
     "try again in",
     "please retry after",
     "resource_exhausted",
+    "quota exceeded",
+    "temporarily unavailable",
+    # Anthropic OAuth subscription limits — surface as 400 with
+    # invalid_request_error. Retryable: usage buckets reset hourly/daily.
+    "out of extra usage",
+    "extra usage is required",
+    "you've reached your",
+    "usage quota",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)

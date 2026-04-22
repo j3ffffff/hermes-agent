@@ -791,6 +791,36 @@ class TestInvalidateSystemPrompt:
         mock_store.load_from_disk.assert_called_once()
 
 
+class TestSessionEndDreaming:
+    def test_shutdown_memory_provider_runs_local_dreaming_when_enabled(self, agent):
+        agent._dreaming_enabled = True
+        agent._dreaming_auto_promote = False
+        agent._memory_store = MagicMock()
+        agent._session_db = MagicMock()
+        agent.platform = "telegram"
+        agent.session_id = "dream-end-1"
+
+        with patch("run_agent.DreamingEngine") as mock_engine_cls:
+            engine = mock_engine_cls.return_value
+            agent.shutdown_memory_provider([{"role": "user", "content": "Fix login auth"}])
+
+        engine.run.assert_called_once()
+        kwargs = engine.run.call_args.kwargs
+        assert kwargs["session_id"] == "dream-end-1"
+        assert kwargs["platform"] == "telegram"
+
+    def test_shutdown_memory_provider_still_calls_memory_manager(self, agent):
+        agent._dreaming_enabled = True
+        agent._memory_manager = MagicMock()
+
+        with patch.object(agent, "_run_local_dreaming") as mock_dream:
+            agent.shutdown_memory_provider([{"role": "user", "content": "hi"}])
+
+        mock_dream.assert_called_once()
+        agent._memory_manager.on_session_end.assert_called_once()
+        agent._memory_manager.shutdown_all.assert_called_once()
+
+
 class TestBuildApiKwargs:
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
@@ -1467,6 +1497,40 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def _make_local_recall_agent(self):
+        cfg = {
+            "memory": {
+                "memory_enabled": False,
+                "user_profile_enabled": False,
+                "local_recall_enabled": True,
+                "local_recall_mode": "full",
+                "local_recall_durable_limit": 3,
+                "local_recall_recent_limit": 2,
+                "local_recall_min_query_chars": 4,
+                "provider": "",
+            },
+            "agent": {},
+            "skills": {},
+            "compression": {},
+            "model": {},
+        }
+        session_db = MagicMock()
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value=cfg),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                session_db=session_db,
+            )
+        agent.client = MagicMock()
+        return agent
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
@@ -1479,6 +1543,54 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_local_recall_context_disabled_by_default(self, agent):
+        agent._local_memory_search = MagicMock()
+
+        assert agent._build_local_recall_context("build command") == ""
+        agent._local_memory_search.build_recall_context.assert_not_called()
+
+    def test_local_recall_context_enabled_and_bounded(self):
+        agent = self._make_local_recall_agent()
+        agent._local_memory_search = MagicMock()
+        agent._local_memory_search.build_recall_context.return_value = {
+            "rendered": "## Durable memory\n- [memory] Build command is npm run build"
+        }
+
+        assert agent._build_local_recall_context("go") == ""
+
+        rendered = agent._build_local_recall_context("build command")
+        assert "npm run build" in rendered
+        agent._local_memory_search.build_recall_context.assert_called_once_with(
+            "build command",
+            mode="full",
+            durable_limit=3,
+            recent_limit=2,
+        )
+
+    def test_local_recall_injected_into_api_user_message(self):
+        agent = self._make_local_recall_agent()
+        self._setup_agent(agent)
+        agent._local_memory_search = MagicMock()
+        agent._local_memory_search.build_recall_context.return_value = {
+            "rendered": "## Durable memory\n- [memory] Build command is npm run build"
+        }
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("build command")
+
+        assert result["final_response"] == "Final answer"
+        api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        user_message = next(msg for msg in api_messages if msg.get("role") == "user")
+        assert "build command" in user_message["content"]
+        assert "<memory-context>" in user_message["content"]
+        assert "npm run build" in user_message["content"]
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
@@ -2927,16 +3039,25 @@ class TestAnthropicCredentialRefresh:
                 skip_memory=True,
             )
 
-        response = SimpleNamespace(content=[])
+        # D3 observability: _anthropic_messages_create now goes through
+        # messages.with_raw_response.create so response headers are captured
+        # for ~/.hermes/logs/anthropic-usage.jsonl.
+        parsed = SimpleNamespace(content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+        raw = MagicMock()
+        raw.parse.return_value = parsed
+        raw.headers = {"request-id": "req_test"}
+        raw.http_response = SimpleNamespace(status_code=200)
         agent._anthropic_client = MagicMock()
-        agent._anthropic_client.messages.create.return_value = response
+        agent._anthropic_client.messages.with_raw_response.create.return_value = raw
 
         with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=True) as refresh:
             result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
 
         refresh.assert_called_once_with()
-        agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
-        assert result is response
+        agent._anthropic_client.messages.with_raw_response.create.assert_called_once_with(
+            model="claude-sonnet-4-20250514"
+        )
+        assert result is parsed
 
 
 # ===================================================================

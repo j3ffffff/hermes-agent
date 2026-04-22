@@ -76,6 +76,8 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block
+from agent.memory_search import LocalMemorySearch
+from agent.dreaming import DreamingEngine
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -1011,6 +1013,14 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        self._local_memory_recall_enabled = False
+        self._local_memory_recall_mode = "full"
+        self._local_memory_recall_durable_limit = 3
+        self._local_memory_recall_recent_limit = 2
+        self._local_memory_recall_min_query_chars = 8
+        self._local_memory_search = None
+        self._dreaming_enabled = False
+        self._dreaming_auto_promote = False
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
@@ -1018,6 +1028,13 @@ class AIAgent:
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
+                self._local_memory_recall_enabled = bool(mem_config.get("local_recall_enabled", False))
+                self._local_memory_recall_mode = str(mem_config.get("local_recall_mode", "full") or "full").strip().lower()
+                self._local_memory_recall_durable_limit = int(mem_config.get("local_recall_durable_limit", 3))
+                self._local_memory_recall_recent_limit = int(mem_config.get("local_recall_recent_limit", 2))
+                self._local_memory_recall_min_query_chars = int(mem_config.get("local_recall_min_query_chars", 8))
+                self._dreaming_enabled = bool(mem_config.get("dreaming_enabled", False))
+                self._dreaming_auto_promote = bool(mem_config.get("dreaming_auto_promote", False))
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
@@ -1027,6 +1044,12 @@ class AIAgent:
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
+
+        if self._local_memory_recall_enabled and (self._memory_store is not None or self._session_db is not None):
+            self._local_memory_search = LocalMemorySearch(
+                memory_store=self._memory_store,
+                session_db=self._session_db,
+            )
         
 
 
@@ -2592,13 +2615,33 @@ class AIAgent:
             "budget_max": self.iteration_budget.max_total,
         }
 
+    def _run_local_dreaming(self, messages: list = None) -> None:
+        """Run the local dreaming engine at real session boundaries when enabled."""
+        if not self._dreaming_enabled:
+            return
+        try:
+            engine = DreamingEngine(
+                memory_store=self._memory_store,
+                session_db=self._session_db,
+                auto_promote=self._dreaming_auto_promote,
+            )
+            engine.run(
+                messages or [],
+                session_id=self.session_id or "",
+                platform=self.platform or "cli",
+                workspace=os.environ.get("TERMINAL_CWD") or os.getcwd(),
+            )
+        except Exception as exc:
+            logger.debug("Local dreaming run failed (non-fatal): %s", exc)
+
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider — call at actual session boundaries.
 
-        This calls on_session_end() then shutdown_all() on the memory
-        manager. NOT called per-turn — only at CLI exit, /reset, gateway
-        session expiry, etc.
+        This runs local dreaming first when enabled, then calls on_session_end()
+        and shutdown_all() on the memory manager. NOT called per-turn — only at
+        CLI exit, /reset, gateway session expiry, etc.
         """
+        self._run_local_dreaming(messages or [])
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -2815,6 +2858,50 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(prompt_parts)
+
+    def _get_local_memory_search(self) -> Optional[LocalMemorySearch]:
+        """Return a hydrated LocalMemorySearch helper when opt-in recall is enabled."""
+        if not self._local_memory_recall_enabled:
+            return None
+        if self._local_memory_search is None:
+            if self._memory_store is None and self._session_db is None:
+                return None
+            self._local_memory_search = LocalMemorySearch(
+                memory_store=self._memory_store,
+                session_db=self._session_db,
+            )
+        else:
+            self._local_memory_search.memory_store = self._memory_store
+            self._local_memory_search.session_db = self._session_db
+        return self._local_memory_search
+
+    def _build_local_recall_context(self, query: str) -> str:
+        """Build compact local recall context for API-call-time injection only."""
+        if not isinstance(query, str):
+            return ""
+        clean_query = query.strip()
+        if not clean_query:
+            return ""
+        if len(clean_query) < max(1, self._local_memory_recall_min_query_chars):
+            return ""
+
+        search = self._get_local_memory_search()
+        if search is None:
+            return ""
+
+        try:
+            payload = search.build_recall_context(
+                clean_query,
+                mode=self._local_memory_recall_mode,
+                durable_limit=max(1, self._local_memory_recall_durable_limit),
+                recent_limit=max(1, self._local_memory_recall_recent_limit),
+            )
+        except Exception as exc:
+            logger.debug("Local memory recall failed (non-fatal): %s", exc)
+            return ""
+
+        rendered = payload.get("rendered", "") if isinstance(payload, dict) else ""
+        return rendered.strip() if isinstance(rendered, str) else ""
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -4244,7 +4331,51 @@ class AIAgent:
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
-        return self._anthropic_client.messages.create(**api_kwargs)
+        try:
+            from agent.anthropic_usage_logger import record_anthropic_call
+        except Exception:
+            record_anthropic_call = None
+
+        started = time.monotonic()
+        model = api_kwargs.get("model")
+        try:
+            raw = self._anthropic_client.messages.with_raw_response.create(**api_kwargs)
+            message = raw.parse()
+            if record_anthropic_call is not None:
+                try:
+                    headers = dict(raw.headers) if raw.headers else {}
+                    usage = getattr(message, "usage", None)
+                    record_anthropic_call(
+                        headers=headers,
+                        model=model,
+                        status=getattr(raw, "http_response", None).status_code
+                            if getattr(raw, "http_response", None) is not None
+                            else 200,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        request_id=headers.get("request-id") or headers.get("Request-Id"),
+                        input_tokens=getattr(usage, "input_tokens", None),
+                        output_tokens=getattr(usage, "output_tokens", None),
+                    )
+                except Exception:
+                    logger.debug("anthropic usage record failed", exc_info=True)
+            return message
+        except Exception as e:
+            if record_anthropic_call is not None:
+                try:
+                    resp = getattr(e, "response", None)
+                    headers = dict(getattr(resp, "headers", {}) or {}) if resp is not None else {}
+                    status = getattr(resp, "status_code", None) if resp is not None else None
+                    record_anthropic_call(
+                        headers=headers,
+                        model=model,
+                        status=status,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        request_id=headers.get("request-id") or headers.get("Request-Id"),
+                        error=str(e)[:500],
+                    )
+                except Exception:
+                    logger.debug("anthropic usage record (error path) failed", exc_info=True)
+            raise
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
@@ -7307,18 +7438,25 @@ class AIAgent:
         # Clear any stale interrupt state at start
         self.clear_interrupt()
 
-        # External memory provider: prefetch once before the tool loop.
-        # Reuse the cached result on every iteration to avoid re-calling
-        # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
+        # Memory recall: prefetch once before the tool loop and reuse the
+        # cached result on every iteration to avoid repeated latency/cost.
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
+        _query = original_user_message if isinstance(original_user_message, str) else ""
+        _prefetch_parts = []
+        _local_prefetch = self._build_local_recall_context(_query)
+        if _local_prefetch:
+            _prefetch_parts.append(_local_prefetch)
         if self._memory_manager:
             try:
-                _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _provider_prefetch = self._memory_manager.prefetch_all(_query) or ""
+                if _provider_prefetch:
+                    _prefetch_parts.append(_provider_prefetch)
             except Exception:
                 pass
+        if _prefetch_parts:
+            _ext_prefetch_cache = "\n\n".join(part for part in _prefetch_parts if part)
 
         while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot

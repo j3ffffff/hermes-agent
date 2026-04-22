@@ -81,6 +81,14 @@ _INVISIBLE_CHARS = {
     '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
 }
 
+_EPHEMERAL_MEMORY_PATTERNS = [
+    r'^done:\s+',
+    r'^completed:\s+',
+    r'\bthis session\b',
+    r'\bkeep working next\b',
+    r'\bwill continue later\b',
+]
+
 
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
@@ -94,6 +102,48 @@ def _scan_memory_content(content: str) -> Optional[str]:
         if re.search(pattern, content, re.IGNORECASE):
             return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
 
+    return None
+
+
+def _normalize_memory_entry(content: str) -> str:
+    """Normalize memory entry text for dedupe and quality checks."""
+    text = content.strip()
+    if not text:
+        return ""
+
+    lines = [line.rstrip() for line in text.splitlines()]
+    non_empty = [line.strip() for line in lines if line.strip()]
+    if not non_empty:
+        return ""
+
+    structured_prefixes = ("- ", "* ", "• ")
+    is_structured = len(non_empty) > 1 and all(
+        line.startswith(structured_prefixes) or re.match(r"^\d+[.)]\s+", line)
+        for line in non_empty[1:]
+    )
+
+    if is_structured:
+        normalized_lines = [re.sub(r'\s+', ' ', line).strip() for line in non_empty]
+        return "\n".join(normalized_lines)
+
+    return re.sub(r'\s+', ' ', " ".join(non_empty)).strip()
+
+
+def _canonicalize_for_dedupe(content: str) -> str:
+    normalized = _normalize_memory_entry(content)
+    normalized = normalized.casefold()
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
+
+
+def _scan_memory_quality(content: str) -> Optional[str]:
+    lowered = content.casefold()
+    for pattern in _EPHEMERAL_MEMORY_PATTERNS:
+        if re.search(pattern, lowered, re.IGNORECASE):
+            return (
+                "Blocked: content appears ephemeral rather than durable memory. "
+                "Skip temporary task progress/session logs and save only stable facts, preferences, or conventions."
+            )
     return None
 
 
@@ -121,12 +171,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
-
-        # Deduplicate entries (preserves order, keeps first occurrence)
-        self.memory_entries = list(dict.fromkeys(self.memory_entries))
-        self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.memory_entries = self._dedupe_entries(self._read_file(mem_dir / "MEMORY.md"))
+        self.user_entries = self._dedupe_entries(self._read_file(mem_dir / "USER.md"))
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -164,8 +210,7 @@ class MemoryStore:
 
         Called under file lock to get the latest state before mutating.
         """
-        fresh = self._read_file(self._path_for(target))
-        fresh = list(dict.fromkeys(fresh))  # deduplicate
+        fresh = self._dedupe_entries(self._read_file(self._path_for(target)))
         self._set_entries(target, fresh)
 
     def save_to_disk(self, target: str):
@@ -195,9 +240,24 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    @staticmethod
+    def _dedupe_entries(entries: List[str]) -> List[str]:
+        deduped: List[str] = []
+        seen = set()
+        for entry in entries:
+            normalized = _normalize_memory_entry(entry)
+            if not normalized:
+                continue
+            canonical = _canonicalize_for_dedupe(normalized)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            deduped.append(normalized)
+        return deduped
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
-        content = content.strip()
+        content = _normalize_memory_entry(content)
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
@@ -206,6 +266,10 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
+        quality_error = _scan_memory_quality(content)
+        if quality_error:
+            return {"success": False, "error": quality_error}
+
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions
             self._reload_target(target)
@@ -213,8 +277,9 @@ class MemoryStore:
             entries = self._entries_for(target)
             limit = self._char_limit(target)
 
-            # Reject exact duplicates
-            if content in entries:
+            # Reject duplicates after canonical normalization
+            existing_canonical = {_canonicalize_for_dedupe(entry) for entry in entries}
+            if _canonicalize_for_dedupe(content) in existing_canonical:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
             # Calculate what the new total would be
@@ -243,7 +308,7 @@ class MemoryStore:
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
-        new_content = new_content.strip()
+        new_content = _normalize_memory_entry(new_content)
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
@@ -253,6 +318,10 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        quality_error = _scan_memory_quality(new_content)
+        if quality_error:
+            return {"success": False, "error": quality_error}
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)

@@ -465,6 +465,16 @@ DEFAULT_CONFIG = {
         "user_profile_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Optional local-first recall injected at API-call time only.
+        # Disabled by default so existing prompt behavior stays stable.
+        "local_recall_enabled": False,
+        "local_recall_mode": "full",      # recent | durable | full
+        "local_recall_durable_limit": 3,
+        "local_recall_recent_limit": 2,
+        "local_recall_min_query_chars": 8,
+        # Conservative local-only dreaming/reflection layer.
+        "dreaming_enabled": False,
+        "dreaming_auto_promote": False,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -569,7 +579,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 13,
+    "_config_version": 15,
 }
 
 # =============================================================================

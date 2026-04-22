@@ -639,6 +639,45 @@ class TestAdversarialEdgeCases:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.billing
 
+    def test_400_anthropic_out_of_extra_usage_is_retryable(self):
+        """Anthropic OAuth 400 'out of extra usage' — the incident on 2026-04-21.
+
+        Prior to the fix this fell through to format_error (retryable=False).
+        The backoff+fallback path needs retryable=True to kick in.
+        """
+        body = {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "You're out of extra usage. Please upgrade your plan.",
+            },
+        }
+        e = MockAPIError("invalid_request_error", status_code=400, body=body)
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_400_quota_exceeded_is_rate_limit(self):
+        e = MockAPIError(
+            "invalid_request_error",
+            status_code=400,
+            body={"error": {"message": "quota exceeded for this model"}},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_400_temporarily_unavailable_is_rate_limit(self):
+        e = MockAPIError(
+            "invalid_request_error",
+            status_code=400,
+            body={"error": {"message": "service temporarily unavailable"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
         class WeirdSuccess(Exception):
